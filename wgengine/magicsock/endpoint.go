@@ -851,6 +851,7 @@ func (de *endpoint) heartbeat() {
 				// We still have a working direct path. Keep it warm at a
 				// reduced rate instead of letting NAT mappings age out, per
 				// the local idle-keepalive override for this peer.
+				de.c.logf("magicsock: idle-keepalive: pinging %v for %v (%v), idle for %v", udpAddr.ap, de.publicKey.ShortString(), de.discoShort(), now.Sub(de.lastSendExt))
 				de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
 				de.heartBeatTimer = time.AfterFunc(idleHeartbeatInterval, de.heartbeat)
 				return
@@ -859,6 +860,7 @@ func (de *endpoint) heartbeat() {
 			// ping timed out and cleared bestAddr). Nothing worth keeping
 			// warm; fall through to the normal idle handling below so the
 			// path gets rediscovered the next time there's real traffic.
+			de.c.logf("magicsock: idle-keepalive: direct path lost for %v (%v), falling back to normal idle handling", de.publicKey.ShortString(), de.discoShort())
 		}
 		// Stop heartbeating.
 		de.c.dlogf("[v1] magicsock: disco: ending heartbeats for idle session to %v (%v)", de.publicKey.ShortString(), de.discoShort())
@@ -921,7 +923,11 @@ func (de *endpoint) setHeartbeatDisabled(v bool) {
 func (de *endpoint) setIdleKeepaliveEnabled(v bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
+	if de.idleKeepaliveEnabled == v {
+		return
+	}
 	de.idleKeepaliveEnabled = v
+	de.c.logf("magicsock: idle-keepalive: set to %v for %v (%v)", v, de.publicKey.ShortString(), de.discoShort())
 	if v && de.heartBeatTimer == nil && !de.heartbeatDisabled && !de.lastSendExt.IsZero() {
 		de.heartBeatTimer = time.AfterFunc(0, de.heartbeat)
 	}
