@@ -103,6 +103,12 @@ type endpoint struct {
 	heartbeatDisabled bool
 	probeUDPLifetime  *probeUDPLifetime // UDP path lifetime probing; nil if disabled
 
+	// idleKeepaliveEnabled is a purely local (not control-plane-granted)
+	// override that keeps de's heartbeat running at idleHeartbeatInterval,
+	// instead of stopping, once the session has been idle for
+	// sessionActiveTimeout. See Conn.SetIdleKeepalivePeers.
+	idleKeepaliveEnabled bool
+
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
@@ -839,7 +845,22 @@ func (de *endpoint) heartbeat() {
 
 	now := mono.Now()
 	if now.Sub(de.lastSendExt) > sessionActiveTimeout {
-		// Session's idle. Stop heartbeating.
+		// Session's idle.
+		if de.idleKeepaliveEnabled {
+			if udpAddr, _, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() {
+				// We still have a working direct path. Keep it warm at a
+				// reduced rate instead of letting NAT mappings age out, per
+				// the local idle-keepalive override for this peer.
+				de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
+				de.heartBeatTimer = time.AfterFunc(idleHeartbeatInterval, de.heartbeat)
+				return
+			}
+			// The direct path is already gone (e.g. a prior idle-keepalive
+			// ping timed out and cleared bestAddr). Nothing worth keeping
+			// warm; fall through to the normal idle handling below so the
+			// path gets rediscovered the next time there's real traffic.
+		}
+		// Stop heartbeating.
 		de.c.dlogf("[v1] magicsock: disco: ending heartbeats for idle session to %v (%v)", de.publicKey.ShortString(), de.discoShort())
 		if afterInactivityFor, ok := de.maybeProbeUDPLifetimeLocked(); ok {
 			// This is the best place to best effort schedule a probe of UDP
@@ -890,6 +911,20 @@ func (de *endpoint) setHeartbeatDisabled(v bool) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.heartbeatDisabled = v
+}
+
+// setIdleKeepaliveEnabled enables or disables the local idle-keepalive
+// override for de (see idleKeepaliveEnabled). When enabling and no heartbeat
+// is currently scheduled (e.g. the session already went idle before this was
+// turned on), it immediately (re)arms the heartbeat loop so a currently valid
+// direct path starts getting kept warm without waiting for new traffic.
+func (de *endpoint) setIdleKeepaliveEnabled(v bool) {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	de.idleKeepaliveEnabled = v
+	if v && de.heartBeatTimer == nil && !de.heartbeatDisabled && !de.lastSendExt.IsZero() {
+		de.heartBeatTimer = time.AfterFunc(0, de.heartbeat)
+	}
 }
 
 // discoverUDPRelayPathsLocked starts UDP relay path discovery.

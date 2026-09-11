@@ -369,6 +369,13 @@ type Conn struct {
 	filt               *filter.Filter     // from last SetFilter
 	relayClientEnabled bool               // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
 	lastFlags          debugFlags         // at time of last SetNetworkMap
+
+	// idleKeepalivePeers is the set of peer node public keys for which the
+	// direct UDP path's heartbeat should keep running (at a reduced rate, see
+	// idleHeartbeatInterval) instead of stopping after sessionActiveTimeout of
+	// inactivity. This is a purely local override, unrelated to any
+	// control-plane-granted node capability. Set via SetIdleKeepalivePeers.
+	idleKeepalivePeers map[key.NodePublic]bool
 	privateKey         key.NodePrivate    // WireGuard private key for this node
 	everHadKey         bool               // whether we ever had a non-zero private key
 	myDerp             int                // nearest DERP region ID; 0 means none/unknown
@@ -2905,6 +2912,21 @@ func (c *Conn) SetProbeUDPLifetime(v bool) {
 	})
 }
 
+// SetIdleKeepalivePeers replaces the set of peer node public keys for which
+// the direct UDP path's heartbeat should keep running at idleHeartbeatInterval
+// after the session goes idle, instead of stopping. Peers not present in
+// peers have idle keepalive disabled. This takes effect immediately for
+// currently known peers, and is also applied to peers added or reconnected
+// afterwards (see upsertPeerLocked).
+func (c *Conn) SetIdleKeepalivePeers(peers map[key.NodePublic]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.idleKeepalivePeers = peers
+	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+		ep.setIdleKeepaliveEnabled(peers[ep.publicKey])
+	})
+}
+
 // capVerIsRelayCapable returns true if version is relay client and server
 // capable, otherwise it returns false.
 func capVerIsRelayCapable(version tailcfg.CapabilityVersion) bool {
@@ -3260,6 +3282,7 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 			oldDiscoKey = epDisco.key
 		}
 		ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
+		ep.setIdleKeepaliveEnabled(c.idleKeepalivePeers[n.Key()])
 		c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
 		return
 	}
@@ -3323,6 +3346,7 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 	}
 
 	ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
+	ep.setIdleKeepaliveEnabled(c.idleKeepalivePeers[n.Key()])
 	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 }
 
@@ -4074,6 +4098,11 @@ const (
 	// heartbeatInterval is how often pings to the best UDP address
 	// are sent.
 	heartbeatInterval = 3 * time.Second
+
+	// idleHeartbeatInterval is how often pings to the best UDP address are
+	// sent, once the session has been idle for sessionActiveTimeout, for
+	// peers with idle keepalive enabled (see endpoint.idleKeepaliveEnabled).
+	idleHeartbeatInterval = 20 * time.Second
 
 	// trustUDPAddrDuration is how long we trust a UDP address as the exclusive
 	// path (without using DERP) without having heard a Pong reply.
